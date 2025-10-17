@@ -1,0 +1,21 @@
+# Example TOML configuration file for mintyparse
+# Copy this to one of these locations:
+#   - $HOME/.config/mintyparse/config.toml
+#   - /etc/mintyparse/mintyparse/config.toml
+#   - Or specify with --config flag
+
+# MapleStory game version (gms, kms, sea, tms, classic, auto)
+game_version = "gms"
+
+# Directory to extract sprites to (optional)
+sprites_dir = "./sprites"
+
+# Log level (trace, debug, info, warn, error, fatal)
+log_level = "info"
+
+# Directory to write log files (optional)
+# If set, logs are written to both stdout and a timestamped file
+log_output_dir = "/var/log/mintyparse"
+
+# Dry run mode (validation only)
+dry_run = false

@@ -1,0 +1,7 @@
+.data
+.env
+.DS_Store
+.helix
+.venv
+mintyparse
+!mintyparse/
