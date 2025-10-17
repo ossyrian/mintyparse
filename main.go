@@ -1,18 +1,16 @@
 package main
 
 import (
-	"context"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
-	"time"
 
-	"github.com/lmittmann/tint"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 
 	"github.com/ossyrian/mintyparse/internal/config"
+	"github.com/ossyrian/mintyparse/internal/logging"
 	"github.com/ossyrian/mintyparse/internal/parser"
 )
 
@@ -79,94 +77,6 @@ func initConfig() {
 	}
 }
 
-// multiHandler sends log records to multiple handlers
-type multiHandler []slog.Handler
-
-func (mh multiHandler) Enabled(ctx context.Context, level slog.Level) bool {
-	for _, h := range mh {
-		if h.Enabled(ctx, level) {
-			return true
-		}
-	}
-	return false
-}
-
-func (mh multiHandler) Handle(ctx context.Context, r slog.Record) error {
-	for _, h := range mh {
-		if err := h.Handle(ctx, r.Clone()); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (mh multiHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
-	handlers := make(multiHandler, len(mh))
-	for i, h := range mh {
-		handlers[i] = h.WithAttrs(attrs)
-	}
-	return handlers
-}
-
-func (mh multiHandler) WithGroup(name string) slog.Handler {
-	handlers := make(multiHandler, len(mh))
-	for i, h := range mh {
-		handlers[i] = h.WithGroup(name)
-	}
-	return handlers
-}
-
-// setupLogging overwrites the global logger based on relevant
-// command args/config
-func setupLogging(cfg *config.Config) error {
-	level := parseLogLevel(cfg.LogLevel)
-
-	consoleHandler := tint.NewHandler(os.Stdout, &tint.Options{Level: level})
-
-	if cfg.LogOutputDir != "" {
-		logDir := os.ExpandEnv(cfg.LogOutputDir)
-
-		if err := os.MkdirAll(logDir, 0o755); err != nil {
-			return fmt.Errorf("failed to create log output directory: %w", err)
-		}
-
-		timestamp := time.Now().Format("20060102_150405")
-		logFileName := fmt.Sprintf("mintyparse_%s.log", timestamp)
-		logFilePath := filepath.Join(logDir, logFileName)
-
-		logFile, err := os.OpenFile(logFilePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
-		if err != nil {
-			return fmt.Errorf("failed to create log file: %w", err)
-		}
-
-		fileHandler := slog.NewJSONHandler(logFile, &slog.HandlerOptions{Level: level})
-
-		slog.SetDefault(slog.New(multiHandler{consoleHandler, fileHandler}))
-
-		fmt.Fprintf(os.Stderr, "Logging to file: %s\n", logFilePath)
-	} else {
-		slog.SetDefault(slog.New(consoleHandler))
-	}
-
-	return nil
-}
-
-// parseLogLevel converts a string log level to slog.Level
-func parseLogLevel(levelStr string) slog.Level {
-	switch levelStr {
-	case "trace", "debug":
-		return slog.LevelDebug
-	case "info":
-		return slog.LevelInfo
-	case "warn":
-		return slog.LevelWarn
-	case "error", "fatal":
-		return slog.LevelError
-	default:
-		return slog.LevelInfo
-	}
-}
-
 // parse runs the main mintyparse command in order to parse
 // the specified WZ file
 func parse(cmd *cobra.Command, args []string) error {
@@ -175,7 +85,7 @@ func parse(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("invalid config: %w", err)
 	}
 
-	if err := setupLogging(cfg); err != nil {
+	if err := logging.Setup(cfg.LogLevel, cfg.LogOutputDir); err != nil {
 		return fmt.Errorf("could not set up logging: %w", err)
 	}
 
