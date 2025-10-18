@@ -6,7 +6,7 @@ import (
 	"io"
 )
 
-// ReadCompressedInt reads a WZ compressed integer from r.
+// ReadCompressedInt32 reads a WZ compressed integer from r.
 // The WZ "compressed 32-bit integer" format is a one- or
 // five-byte data type which can be read as follows:
 //   - The first byte is always an int8. If its value fits
@@ -14,6 +14,8 @@ import (
 //     compressed integer.
 //   - If the first byte is exactly -128, then the next
 //     4 bytes are a little-endian int32.
+//
+// Reference: MapleLib WzBinaryReader.ReadCompressedInt
 func ReadCompressedInt32(r io.Reader, x *int32) error {
 	var sb int8
 	if err := binary.Read(r, binary.LittleEndian, &sb); err != nil {
@@ -31,25 +33,31 @@ func ReadCompressedInt32(r io.Reader, x *int32) error {
 	return nil
 }
 
-// ReadEncryptedString reads a WZ encrypted string from r.
-// TODO: This is a placeholder that reads unencrypted strings for now.
-// The actual implementation requires WzKey for XOR decryption.
+// ReadEncryptedString reads and decrypts a WZ encrypted string from r.
 //
-// Length indicator (1 byte, sbyte):
-//   - 0: Empty string
-//   - Positive (1 to 126): Unicode string, this many characters
-//   - 127: Unicode string, read next 4 bytes (int32) for actual length
-//   - Negative (-1 to -127): ASCII string, absolute value is length
-//   - -128: ASCII string, read next 4 bytes (int32) for actual length
-func ReadEncryptedString(r io.Reader) (string, error) {
+// Format:
+//   1. Length indicator (1 byte, signed):
+//      - 0: Empty string
+//      - Positive (1-126): Unicode string with this many characters
+//      - 127: Unicode string, read next 4 bytes (int32) for actual length
+//      - Negative (-1 to -127): ASCII string, absolute value is length
+//      - -128: ASCII string, read next 4 bytes (int32) for actual length
+//   2. String data (encrypted):
+//      - Unicode: 2 bytes per character (UTF-16LE)
+//      - ASCII: 1 byte per character
+//
+// The key is used for decryption (see Key.DecryptString for algorithm details).
+//
+// Reference: MapleLib WzBinaryReader.ReadString
+func ReadEncryptedString(r io.Reader, key *Key, str *string) error {
 	var lengthIndicator int8
 	if err := binary.Read(r, binary.LittleEndian, &lengthIndicator); err != nil {
-		return "", fmt.Errorf("failed to read string length indicator: %w", err)
+		return fmt.Errorf("failed to read string length indicator: %w", err)
 	}
 
-	// Empty string
 	if lengthIndicator == 0 {
-		return "", nil
+		*str = ""
+		return nil
 	}
 
 	var length int32
@@ -64,7 +72,7 @@ func ReadEncryptedString(r io.Reader) (string, error) {
 	case lengthIndicator == 127:
 		// Unicode string, long length
 		if err := binary.Read(r, binary.LittleEndian, &length); err != nil {
-			return "", fmt.Errorf("failed to read unicode string length: %w", err)
+			return fmt.Errorf("failed to read unicode string length: %w", err)
 		}
 		isUnicode = true
 
@@ -76,109 +84,121 @@ func ReadEncryptedString(r io.Reader) (string, error) {
 	case lengthIndicator == -128:
 		// ASCII string, long length
 		if err := binary.Read(r, binary.LittleEndian, &length); err != nil {
-			return "", fmt.Errorf("failed to read ascii string length: %w", err)
+			return fmt.Errorf("failed to read ascii string length: %w", err)
 		}
 		isUnicode = false
 	}
 
 	if length < 0 {
-		return "", fmt.Errorf("invalid string length: %d", length)
+		return fmt.Errorf("invalid string length: %d", length)
 	}
 
-	// TODO: Implement proper decryption with WzKey
-	// For now, read unencrypted bytes
+	// Calculate byte length (Unicode uses 2 bytes per character)
+	byteLength := int(length)
 	if isUnicode {
-		// Unicode: 2 bytes per character (UTF-16LE)
-		buf := make([]byte, length*2)
-		if _, err := io.ReadFull(r, buf); err != nil {
-			return "", fmt.Errorf("failed to read unicode string data: %w", err)
-		}
-		// TODO: XOR decryption with WzKey and mask (0xAAAA initial, increment)
-		// For now, just convert UTF-16LE to string (placeholder)
-		runes := make([]rune, length)
-		for i := int32(0); i < length; i++ {
-			runes[i] = rune(binary.LittleEndian.Uint16(buf[i*2:]))
-		}
-		return string(runes), nil
-	} else {
-		// ASCII: 1 byte per character
-		buf := make([]byte, length)
-		if _, err := io.ReadFull(r, buf); err != nil {
-			return "", fmt.Errorf("failed to read ascii string data: %w", err)
-		}
-		// TODO: XOR decryption with WzKey and mask (0xAA initial, increment)
-		return string(buf), nil
+		byteLength *= 2
 	}
+
+	// Read encrypted string data
+	encrypted := make([]byte, byteLength)
+	if _, err := io.ReadFull(r, encrypted); err != nil {
+		return fmt.Errorf("failed to read string data: %w", err)
+	}
+
+	// Decrypt using the WZ key
+	*str = key.DecryptString(encrypted, isUnicode)
+	return nil
 }
 
-// ReadStringBlock reads a string that may be stored inline or at an offset.
-// This is used for directory entry names and property names.
+// ReadOffsetOrInlineString reads a string that may be stored inline or at an offset.
+// Used for directory entry names and property names in WZ files.
 //
-// Indicator byte:
-//   - 0x00 or 0x73: String data follows inline
-//   - 0x01 or 0x1B: Read int32 offset, then read string at that position
-func ReadStringBlock(rs io.ReadSeeker) (string, error) {
+// Format:
+//   1. Indicator byte:
+//      - 0x00 or 0x73: String data follows inline
+//      - 0x01 or 0x1B: String is at offset (next 4 bytes = int32 offset)
+//   2. String data (if inline) OR offset (if offset-based)
+//
+// If the string is stored at an offset, this function:
+//   - Reads the int32 offset value
+//   - Seeks to that position in the file
+//   - Reads the encrypted string
+//   - Seeks back to the original position (after indicator + offset bytes)
+//
+// Reference: MapleLib WzBinaryReader.ReadStringBlock
+func ReadOffsetOrInlineString(rs io.ReadSeeker, key *Key, str *string) error {
 	var indicator byte
 	if err := binary.Read(rs, binary.LittleEndian, &indicator); err != nil {
-		return "", fmt.Errorf("failed to read string block indicator: %w", err)
+		return fmt.Errorf("failed to read string indicator: %w", err)
 	}
 
 	switch indicator {
 	case 0x00, 0x73:
 		// String follows inline
-		return ReadEncryptedString(rs)
+		return ReadEncryptedString(rs, key, str)
 
 	case 0x01, 0x1B:
 		// String is at an offset
 		var offset int32
 		if err := binary.Read(rs, binary.LittleEndian, &offset); err != nil {
-			return "", fmt.Errorf("failed to read string offset: %w", err)
+			return fmt.Errorf("failed to read string offset: %w", err)
 		}
 
-		// Save current position
+		// Save current position to return here after reading
 		currentPos, err := rs.Seek(0, io.SeekCurrent)
 		if err != nil {
-			return "", fmt.Errorf("failed to get current position: %w", err)
+			return fmt.Errorf("failed to get current position: %w", err)
 		}
+		defer func() {
+			// Always seek back to where we were, even if reading fails
+			rs.Seek(currentPos, io.SeekStart)
+		}()
 
 		// Seek to string location
 		if _, err := rs.Seek(int64(offset), io.SeekStart); err != nil {
-			return "", fmt.Errorf("failed to seek to string at offset %d: %w", offset, err)
+			return fmt.Errorf("failed to seek to string at offset %d: %w", offset, err)
 		}
 
-		// Read string
-		str, err := ReadEncryptedString(rs)
-		if err != nil {
-			return "", fmt.Errorf("failed to read string at offset %d: %w", offset, err)
+		// Read and decrypt the string
+		if err := ReadEncryptedString(rs, key, str); err != nil {
+			return fmt.Errorf("failed to read string at offset %d: %w", offset, err)
 		}
 
-		// Seek back to saved position
-		if _, err := rs.Seek(currentPos, io.SeekStart); err != nil {
-			return "", fmt.Errorf("failed to seek back to position %d: %w", currentPos, err)
-		}
-
-		return str, nil
+		return nil
 
 	default:
-		return "", fmt.Errorf("unknown string block indicator: 0x%02X", indicator)
+		return fmt.Errorf("unknown string indicator: 0x%02X", indicator)
 	}
 }
 
-// ReadEncryptedOffset reads an encrypted uint32 offset from r.
-// TODO: This is a placeholder that reads unencrypted offsets for now.
-// The actual implementation requires version hash calculation and complex XOR operations:
-//  1. Calculate: (position - dataOffset) XOR 0xFFFFFFFF
-//  2. Multiply by version hash
-//  3. Subtract constant: 0x581C3F6D
-//  4. Rotate left by (result & 0x1F) bits
-//  5. Read encrypted offset (4 bytes, uint32)
-//  6. XOR with result from step 4
-//  7. Add dataOffset × 2
-func ReadEncryptedOffset(r io.Reader) (uint32, error) {
-	var offset uint32
-	if err := binary.Read(r, binary.LittleEndian, &offset); err != nil {
-		return 0, fmt.Errorf("failed to read encrypted offset: %w", err)
+// ReadEncryptedOffset reads and decrypts a WZ file offset from r.
+//
+// File offsets in WZ files are encrypted using the version hash to prevent tampering.
+// The current file position is used as part of the decryption algorithm, so the reader
+// must be positioned exactly where the encrypted offset begins.
+//
+// Parameters:
+//   - r: Reader positioned at the encrypted offset
+//   - bodyOffset: Where WZ data begins (from file header)
+//   - versionHash: Hash calculated from MapleStory version (e.g., "263" → 54036)
+//   - offset: Output - decrypted absolute file offset
+//
+// The decryption uses bitwise operations (XOR, rotation) and the version hash.
+// See DecryptOffset in crypto.go for the full algorithm.
+func ReadEncryptedOffset(r io.ReadSeeker, bodyOffset uint32, versionHash uint32, offset *uint32) error {
+	// Get current position before reading the encrypted offset
+	currentPos, err := r.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return fmt.Errorf("failed to get current position: %w", err)
 	}
-	// TODO: Implement proper offset decryption using version hash
-	return offset, nil
+
+	// Read the encrypted offset value
+	var encryptedOffset uint32
+	if err := binary.Read(r, binary.LittleEndian, &encryptedOffset); err != nil {
+		return fmt.Errorf("failed to read encrypted offset: %w", err)
+	}
+
+	// Decrypt and store in output parameter
+	*offset = DecryptOffset(uint32(currentPos), bodyOffset, versionHash, encryptedOffset)
+	return nil
 }

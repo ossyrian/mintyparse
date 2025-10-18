@@ -13,12 +13,14 @@ type Dir struct {
 	EntriesMetadata []DirEntryMetadata
 }
 
+// DirEntryMetadata contains metadata for a single directory entry.
+// All encrypted fields are stored in decrypted form after reading.
 type DirEntryMetadata struct {
 	Type       DirEntryType
-	Name       string
-	FileSize   int32
-	Checksum   int32  // validation checksum
-	DataOffset uint32 // where the data lives
+	Name       string // Entry name (decrypted)
+	FileSize   int32  // Size in bytes
+	Checksum   int32  // Validation checksum
+	DataOffset uint32 // Absolute file offset to entry data (decrypted)
 }
 
 type DirEntryType byte
@@ -31,7 +33,7 @@ const (
 	// DirEntryTypeReference (0x02) indicates that the data for this entry is stored
 	// at another location in the file, probably for deduplication purposes.
 	// The next read after discovering this byte will be an int32
-	// indicating the offset (relative to Header.DataOffset) where the
+	// indicating the offset (relative to Header.BodyOffset) where the
 	// underlying type is located.
 	//
 	// [0x02][name_offset(int32)][size(compressed int32)][checksum(compressed int32)][data_offset(compressed int32)]

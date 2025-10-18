@@ -18,10 +18,19 @@ type WzReader struct {
 	logger *slog.Logger
 	header *wz.Header // WZ file header
 
-	// versionHeader is used to calculate the version hash,
-	// which is required for offset decryption. For files without a version header,
-	// versionHeader will be 0 and requires version number bruteforce (770-779).
-	versionHeader uint16 // Version header (obfuscated checksum), 0 if no version header
+	// Encryption state
+	// versionHeader is the 2-byte version header from the file (0 if no version header).
+	// For files without a version header, version numbers must be bruteforced (typically 770-779).
+	versionHeader uint16
+
+	// versionHash is the hash calculated from the MapleStory version number.
+	// This hash is used for offset decryption. It's derived from the version string
+	// (e.g., "83", "230", "777") using the VersionHash function.
+	versionHash uint32
+
+	// key is the encryption key stream used for string decryption.
+	// It's generated from the initialization vector (IV) for the game region.
+	key *wz.Key
 }
 
 // ReadHeader reads header information from a WZ file.
@@ -83,150 +92,258 @@ func (r *WzReader) ReadHeader() (*wz.Header, error) {
 	return h, nil
 }
 
-// DetectFormat determines whether the WZ file has a version header.
-// Returns true if the file has a version header.
-func (r *WzReader) DetectFormat() (hasVersionHeader bool, err error) {
-	defer func() {
-		if _, seekErr := r.file.Seek(int64(r.header.BodyOffset), io.SeekStart); seekErr != nil && err == nil {
-			err = fmt.Errorf("failed to seek back to data offset: %w", seekErr)
-		}
-	}()
-
-	// Read 2 bytes at data offset to check for version header
-	var versionCheck uint16
-	if err := binary.Read(r.file, binary.LittleEndian, &versionCheck); err != nil {
-		return false, fmt.Errorf("failed to read version check bytes: %w", err)
+// ReadVersionHeader detects and reads the version header if present.
+// Returns the version header value (0 if not present) and any error.
+// The version header is an obfuscated checksum derived from the MapleStory version number.
+func (r *WzReader) ReadVersionHeader() (uint16, error) {
+	var version uint16
+	if err := binary.Read(r.file, binary.LittleEndian, &version); err != nil {
+		return 0, fmt.Errorf("failed to read version header: %w", err)
 	}
 
-	// Default: assume has version header
-	hasVersionHeader = true
-
-	if versionCheck > 0xFF {
-		// no version header present
-		// version headers are single-byte values, so > 255 means no header
-		hasVersionHeader = false
+	// version headers are single-byte values, so > 255 means no header
+	if version > 0xFF {
 		r.logger.Debug("detected format without version header (value > 255)",
-			"check_value", versionCheck,
-		)
-	} else if versionCheck == 0x80 {
-		// special case: 0x80 is the compressed int marker
-		// could be a version header OR the start of a compressed int
-		// check if it looks like a valid compressed int pattern: 80 00 xx xx
-
-		// seek back to data offset and read as compressed int
+			"check_value", version)
 		if _, err := r.file.Seek(int64(r.header.BodyOffset), io.SeekStart); err != nil {
-			return false, fmt.Errorf("failed to seek to data offset: %w", err)
+			return 0, fmt.Errorf("failed to seek back to data offset: %w", err)
+		}
+		return 0, nil
+	}
+
+	// special case: 0x80 is the compressed int marker
+	// could be a version header OR the start of a compressed int
+	// try reading as compressed int to disambiguate
+	if version == 0x80 {
+		if _, err := r.file.Seek(int64(r.header.BodyOffset), io.SeekStart); err != nil {
+			return 0, fmt.Errorf("failed to seek to data offset: %w", err)
 		}
 
 		var entryCount int32
 		if err := wz.ReadCompressedInt32(r.file, &entryCount); err != nil {
-			return false, fmt.Errorf("failed to read entry count: %w", err)
+			return 0, fmt.Errorf("failed to read entry count: %w", err)
 		}
 
-		// check if it looks like a valid directory entry count
-		// if the compressed int decoded to a reasonable value, no version header present
-		// entry counts are typically small positive numbers
+		// if the compressed int decoded to a reasonable entry count, no version header present
 		if entryCount > 0 && entryCount <= 0xFFFF {
-			hasVersionHeader = false
 			r.logger.Debug("detected format without version header (compressed int pattern)",
 				"entry_count", entryCount)
-		} else {
-			r.logger.Debug("detected format with version header (0x80 value)",
-				"version_header", versionCheck)
+			return 0, nil
 		}
-	} else {
-		// version header present (values 0x00-0x7F, 0x81-0xFF)
+
+		// looks like a version header after all, seek past it
+		if _, err := r.file.Seek(int64(r.header.BodyOffset)+2, io.SeekStart); err != nil {
+			return 0, fmt.Errorf("failed to seek past version header: %w", err)
+		}
 		r.logger.Debug("detected format with version header",
-			"version_header", versionCheck)
+			"version_header", version)
+		return version, nil
 	}
 
-	return hasVersionHeader, nil
+	// version header present (values 0x00-0x7F, 0x81-0xFF)
+	r.logger.Debug("detected format with version header",
+		"version_header", version)
+
+	return version, nil
 }
 
-// ReadVersionHeader reads the 2-byte version header from the WZ file.
-// This is an obfuscated checksum derived from the MapleStory version number.
-func (r *WzReader) ReadVersionHeader() (uint16, error) {
-	var v uint16
-	if err := binary.Read(r.file, binary.LittleEndian, &v); err != nil {
-		return v, fmt.Errorf("failed to read version header: %w", err)
-	}
-	return v, nil
-}
+// determineVersionHash calculates or bruteforces the version hash for offset decryption.
+//
+// If userProvidedVersion is not empty:
+//   - Calculates hash directly from the version string
+//   - Validates it matches the file's version header (if present)
+//   - Falls back to bruteforce if validation fails
+//
+// If userProvidedVersion is empty:
+//   - Bruteforces by trying version ranges until finding one that decrypts correctly
+func (r *WzReader) determineVersionHash(userProvidedVersion string) error {
+	// User provided explicit version
+	if userProvidedVersion != "" {
+		r.versionHash = wz.VersionHash(userProvidedVersion)
 
-// ReadDirEntryMetadata reads the metadata for a single directory entry.
-// Returns nil if the entry should be skipped (type 1).
-func (r *WzReader) ReadDirEntryMetadata() (entry *wz.DirEntryMetadata, err error) {
-	entry = &wz.DirEntryMetadata{}
+		// Validate against version header if present
+		if r.versionHeader != 0 {
+			expectedObfuscated := wz.ObfuscateVersionHash(r.versionHash)
+			if expectedObfuscated != r.versionHeader {
+				r.logger.Warn("version mismatch, trying bruteforce",
+					"provided", userProvidedVersion,
+					"expected_header", expectedObfuscated,
+					"actual_header", r.versionHeader)
 
-	if err = binary.Read(r.file, binary.LittleEndian, &entry.Type); err != nil {
-		return nil, fmt.Errorf("failed to read entry type: %w", err)
-	}
-
-	switch entry.Type {
-	case wz.DirEntryTypeIgnore:
-		if _, err := r.file.Seek(10, io.SeekCurrent); err != nil {
-			return nil, fmt.Errorf("failed to skip type 1 entry: %w", err)
-		}
-		return nil, nil
-	case wz.DirEntryTypeReference:
-		// 0x02 - data lives somewhere else
-		var referenceOffset int32
-		if err := binary.Read(r.file, binary.LittleEndian, &referenceOffset); err != nil {
-			return nil, fmt.Errorf("failed to read reference offset: %w", err)
-		}
-
-		// remember where we are
-		currentPos, err := r.file.Seek(0, io.SeekCurrent)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get current position: %w", err)
-		}
-		defer func() {
-			if _, seekErr := r.file.Seek(currentPos, io.SeekStart); seekErr != nil {
-				if err == nil {
-					err = fmt.Errorf("failed to seek back: %w", seekErr)
+				if err := r.bruteforceVersion(); err != nil {
+					r.logger.Warn("bruteforce failed, using provided version",
+						"error", err)
+				} else {
+					return nil // Bruteforce succeeded
 				}
 			}
-		}()
-
-		// go to data
-		absoluteOffset := int64(r.header.BodyOffset) + int64(referenceOffset)
-		if _, err := r.file.Seek(absoluteOffset, io.SeekStart); err != nil {
-			return nil, fmt.Errorf("failed to seek to entry data at offset %d: %w", absoluteOffset, err)
 		}
 
-		// actually read the data there
-		actualEntry, err := r.ReadDirEntryMetadata()
-		if err != nil {
-			return nil, fmt.Errorf("failed to read referenced entry: %w", err)
-		}
-
-		return actualEntry, nil
-	case wz.DirEntryTypeDir, wz.DirEntryTypeFile:
-		// 0x03, 0x04: read entry data directly
-		var err error
-		entry.Name, err = wz.ReadEncryptedString(r.file)
-		if err != nil {
-			return nil, fmt.Errorf("failed to read entry name: %w", err)
-		}
-
-		if err := wz.ReadCompressedInt32(r.file, &entry.FileSize); err != nil {
-			return nil, fmt.Errorf("failed to read file size for %s: %w", entry.Name, err)
-		}
-
-		if err := wz.ReadCompressedInt32(r.file, &entry.Checksum); err != nil {
-			return nil, fmt.Errorf("failed to read checksum for %s: %w", entry.Name, err)
-		}
-
-		entry.DataOffset, err = wz.ReadEncryptedOffset(r.file)
-		if err != nil {
-			return nil, fmt.Errorf("failed to read offset for %s: %w", entry.Name, err)
-		}
-
-		return entry, nil
-
-	default:
-		return nil, fmt.Errorf("unknown directory entry type: %d", entry.Type)
+		r.logger.Info("using MapleStory version",
+			"version", userProvidedVersion,
+			"version_hash", r.versionHash)
+		return nil
 	}
+
+	// No version provided - bruteforce
+	r.logger.Info("bruteforcing MapleStory version",
+		"version_header", r.versionHeader)
+
+	if err := r.bruteforceVersion(); err != nil {
+		return fmt.Errorf("failed to find version: %w (hint: use --game-version flag)", err)
+	}
+
+	return nil
+}
+
+// bruteforceVersion finds the MapleStory version by trying candidate versions.
+//
+// For files with version header (old format):
+//   - Only tries versions where ObfuscateVersionHash matches the header
+//   - Typically finds a match quickly (version header narrows the search)
+//
+// For files without version header (64-bit format):
+//   - Tries versions 770-779 (typical 64-bit encryption versions)
+//
+// Validation: A version is considered correct if the first directory entry name
+// decrypts to valid ASCII (alphanumeric + common punctuation).
+func (r *WzReader) bruteforceVersion() error {
+	startPos, err := r.file.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return fmt.Errorf("failed to save position: %w", err)
+	}
+	defer r.file.Seek(startPos, io.SeekStart)
+
+	// Version ranges to try, ordered by likelihood
+	ranges := r.getVersionRanges()
+
+	for _, vRange := range ranges {
+		for v := vRange.start; v <= vRange.end; v++ {
+			versionStr := fmt.Sprintf("%d", v)
+			hash := wz.VersionHash(versionStr)
+
+			// For old format, skip versions that don't match the version header
+			if r.versionHeader != 0 {
+				if wz.ObfuscateVersionHash(hash) != r.versionHeader {
+					continue
+				}
+			}
+
+			// Try parsing with this version hash
+			if r.tryVersion(hash) {
+				r.versionHash = hash
+				r.logger.Info("found matching version",
+					"version", versionStr,
+					"version_hash", hash,
+					"range", vRange.desc)
+				return nil
+			}
+		}
+	}
+
+	return fmt.Errorf("no valid version found (version_header=%d)", r.versionHeader)
+}
+
+// getVersionRanges returns version number ranges to try during bruteforce.
+func (r *WzReader) getVersionRanges() []struct {
+	start int
+	end   int
+	desc  string
+} {
+	if r.versionHeader == 0 {
+		// 64-bit format - try standard encryption version range
+		return []struct {
+			start int
+			end   int
+			desc  string
+		}{
+			{770, 779, "64-bit"},
+		}
+	}
+
+	// Old format with version header - try MapleStory patch version ranges
+	return []struct {
+		start int
+		end   int
+		desc  string
+	}{
+		{200, 300, "modern"},
+		{100, 199, "mid-era"},
+		{80, 99, "classic"},
+		{1, 79, "very old"},
+	}
+}
+
+// tryVersion tests if a version hash correctly decrypts the directory structure.
+// It attempts to read the first directory entry and validates the decrypted name.
+func (r *WzReader) tryVersion(versionHash uint32) bool {
+	// Seek to directory start (skip version header if present)
+	dirStart := int64(r.header.BodyOffset)
+	if r.versionHeader != 0 {
+		dirStart += 2
+	}
+
+	if _, err := r.file.Seek(dirStart, io.SeekStart); err != nil {
+		return false
+	}
+
+	// Temporarily use this version hash
+	oldHash := r.versionHash
+	r.versionHash = versionHash
+	defer func() { r.versionHash = oldHash }()
+
+	// Read and validate entry count
+	var entryCount int32
+	if err := wz.ReadCompressedInt32(r.file, &entryCount); err != nil {
+		return false
+	}
+
+	// Sanity check: entry count should be reasonable
+	if entryCount <= 0 || entryCount > 1000 {
+		return false
+	}
+
+	// Try to read the first directory entry
+	entry, err := r.ReadDirEntryMetadata()
+	if err != nil || entry == nil {
+		return false
+	}
+
+	// Validate the decrypted name
+	return isValidWzName(entry.Name)
+}
+
+// isValidWzName checks if a decrypted string looks like a valid WZ directory/file name.
+//
+// Valid WZ names are typically English words (e.g., "Cash", "Consume", "Install")
+// and should contain only:
+//   - Letters (A-Z, a-z)
+//   - Numbers (0-9)
+//   - Common punctuation (_, ., -)
+//
+// This validation helps distinguish correctly decrypted names from garbage output.
+func isValidWzName(name string) bool {
+	if len(name) == 0 || len(name) > 100 {
+		return false
+	}
+
+	hasLetter := false
+	for _, ch := range name {
+		switch {
+		case (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z'):
+			hasLetter = true
+		case ch >= '0' && ch <= '9':
+			// Numbers OK
+		case ch == '_' || ch == '.' || ch == '-':
+			// Common filename characters OK
+		default:
+			// Any other character (including control chars) = invalid
+			return false
+		}
+	}
+
+	// Must have at least one letter to be a valid name
+	return hasLetter
 }
 
 func (r *WzReader) ReadDir() (*wz.Dir, error) {
@@ -270,12 +387,71 @@ func (r *WzReader) ReadDir() (*wz.Dir, error) {
 	return d, nil
 }
 
+// ReadDirEntryMetadata reads the metadata for a single directory entry.
+// Returns nil if the entry should be skipped (type 1).
+func (r *WzReader) ReadDirEntryMetadata() (*wz.DirEntryMetadata, error) {
+	entry := &wz.DirEntryMetadata{}
+
+	if err := binary.Read(r.file, binary.LittleEndian, &entry.Type); err != nil {
+		return nil, fmt.Errorf("failed to read entry type: %w", err)
+	}
+
+	switch entry.Type {
+	case wz.DirEntryTypeIgnore:
+		if _, err := r.file.Seek(10, io.SeekCurrent); err != nil {
+			return nil, fmt.Errorf("failed to skip ignored entry: %w", err)
+		}
+		return nil, nil
+
+	case wz.DirEntryTypeReference:
+		var referenceOffset int32
+		if err := binary.Read(r.file, binary.LittleEndian, &referenceOffset); err != nil {
+			return nil, fmt.Errorf("failed to read reference offset: %w", err)
+		}
+
+		currentPos, err := r.file.Seek(0, io.SeekCurrent)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get current position: %w", err)
+		}
+		defer r.file.Seek(currentPos, io.SeekStart)
+
+		absoluteOffset := int64(r.header.BodyOffset) + int64(referenceOffset)
+		if _, err := r.file.Seek(absoluteOffset, io.SeekStart); err != nil {
+			return nil, fmt.Errorf("failed to seek to referenced entry at offset %d: %w", absoluteOffset, err)
+		}
+
+		return r.ReadDirEntryMetadata()
+
+	case wz.DirEntryTypeDir, wz.DirEntryTypeFile:
+		if err := wz.ReadEncryptedString(r.file, r.key, &entry.Name); err != nil {
+			return nil, fmt.Errorf("failed to read entry name: %w", err)
+		}
+
+		if err := wz.ReadCompressedInt32(r.file, &entry.FileSize); err != nil {
+			return nil, fmt.Errorf("failed to read file size for %s: %w", entry.Name, err)
+		}
+
+		if err := wz.ReadCompressedInt32(r.file, &entry.Checksum); err != nil {
+			return nil, fmt.Errorf("failed to read checksum for %s: %w", entry.Name, err)
+		}
+
+		if err := wz.ReadEncryptedOffset(r.file, r.header.BodyOffset, r.versionHash, &entry.DataOffset); err != nil {
+			return nil, fmt.Errorf("failed to read offset for %s: %w", entry.Name, err)
+		}
+
+		return entry, nil
+
+	default:
+		return nil, fmt.Errorf("unknown directory entry type: %d", entry.Type)
+	}
+}
+
 func Parse(file *os.File, cfg *config.Config) error {
 	logger := slog.With(
 		"file", cfg.InputFile,
 	)
 
-	logger.Info("starting")
+	logger.Info("starting parse")
 
 	reader := &WzReader{
 		file:   file,
@@ -283,29 +459,38 @@ func Parse(file *os.File, cfg *config.Config) error {
 		logger: logger,
 	}
 
+	// Read file header
 	_, err := reader.ReadHeader()
 	if err != nil {
 		return err
 	}
 
-	hasVersionHeader, err := reader.DetectFormat()
+	// Initialize encryption key from game region IV
+	ivBytes, err := wz.IVForVersion(cfg.GameRegion)
 	if err != nil {
-		return fmt.Errorf("failed to detect format: %w", err)
+		return fmt.Errorf("failed to get IV for game region %s: %w", cfg.GameRegion, err)
 	}
 
-	if hasVersionHeader {
-		reader.versionHeader, err = reader.ReadVersionHeader()
-		if err != nil {
-			return err
-		}
+	var iv [4]byte
+	copy(iv[:], ivBytes)
+	reader.key = wz.NewKey(iv)
 
-		logger.Info("detected format with version header",
-			"version_header", reader.versionHeader,
-		)
-	} else {
-		logger.Info("detected format without version header")
+	logger.Debug("initialized encryption key",
+		"game_region", cfg.GameRegion,
+		"iv", fmt.Sprintf("%02X %02X %02X %02X", iv[0], iv[1], iv[2], iv[3]))
+
+	// Read version header (0 if not present)
+	reader.versionHeader, err = reader.ReadVersionHeader()
+	if err != nil {
+		return fmt.Errorf("failed to read version header: %w", err)
 	}
 
+	// Determine version hash for offset decryption
+	if err := reader.determineVersionHash(cfg.GameVersion); err != nil {
+		return err
+	}
+
+	// Read directory structure
 	_, err = reader.ReadDir()
 	if err != nil {
 		return err

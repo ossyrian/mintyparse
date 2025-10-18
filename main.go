@@ -39,7 +39,8 @@ func init() {
 	rootCmd.MarkFlagRequired("output")
 
 	// game/format-specific settings
-	rootCmd.Flags().String("game-version", "gms", "MapleStory game version (gms, kms, sea, tms)")
+	rootCmd.Flags().String("game-region", "gms", "MapleStory game region/edition (gms, kms, sea, tms)")
+	rootCmd.Flags().String("game-version", "", "MapleStory patch version number (e.g., 263, 230); if not provided, will bruteforce")
 
 	// other opts
 	rootCmd.Flags().String("log-level", "info", "log level (trace, debug, info, warn, error, fatal)")
@@ -49,6 +50,7 @@ func init() {
 	viper.BindPFlag("input", rootCmd.Flags().Lookup("input"))
 	viper.BindPFlag("output", rootCmd.Flags().Lookup("output"))
 	viper.BindPFlag("sprites_dir", rootCmd.Flags().Lookup("sprites-output"))
+	viper.BindPFlag("game_region", rootCmd.Flags().Lookup("game-region"))
 	viper.BindPFlag("game_version", rootCmd.Flags().Lookup("game-version"))
 	viper.BindPFlag("log_level", rootCmd.Flags().Lookup("log-level"))
 	viper.BindPFlag("log_output_dir", rootCmd.Flags().Lookup("log-output-dir"))
