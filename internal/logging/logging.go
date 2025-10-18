@@ -1,7 +1,6 @@
 package logging
 
 import (
-	"context"
 	"fmt"
 	"log/slog"
 	"os"
@@ -9,44 +8,8 @@ import (
 	"time"
 
 	"github.com/lmittmann/tint"
+	slogmulti "github.com/samber/slog-multi"
 )
-
-// multiHandler sends log records to multiple handlers
-type multiHandler []slog.Handler
-
-func (mh multiHandler) Enabled(ctx context.Context, level slog.Level) bool {
-	for _, h := range mh {
-		if h.Enabled(ctx, level) {
-			return true
-		}
-	}
-	return false
-}
-
-func (mh multiHandler) Handle(ctx context.Context, r slog.Record) error {
-	for _, h := range mh {
-		if err := h.Handle(ctx, r.Clone()); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (mh multiHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
-	handlers := make(multiHandler, len(mh))
-	for i, h := range mh {
-		handlers[i] = h.WithAttrs(attrs)
-	}
-	return handlers
-}
-
-func (mh multiHandler) WithGroup(name string) slog.Handler {
-	handlers := make(multiHandler, len(mh))
-	for i, h := range mh {
-		handlers[i] = h.WithGroup(name)
-	}
-	return handlers
-}
 
 // Setup configures the global slog logger
 // If logOutputDir is non-empty, logs are written to both stdout and a timestamped file in that directory
@@ -73,7 +36,9 @@ func Setup(levelStr string, logOutputDir string) error {
 
 		fileHandler := slog.NewJSONHandler(logFile, &slog.HandlerOptions{Level: level})
 
-		slog.SetDefault(slog.New(multiHandler{consoleHandler, fileHandler}))
+		slog.SetDefault(slog.New(
+			slogmulti.Fanout(consoleHandler, fileHandler),
+		))
 
 		fmt.Fprintf(os.Stderr, "Logging to file: %s\n", logFilePath)
 	} else {

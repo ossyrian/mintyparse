@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"io"
+	"log/slog"
 	"reflect"
 	"testing"
 
@@ -42,11 +43,11 @@ func TestWzReader_ReadHeader(t *testing.T) {
 	}{
 		{
 			name:  "valid header with minimal copyright",
-			input: buildValidHeader(500000, "Test"),
+			input: buildValidHeader(500000, "test"),
 			want: &wz.Header{
 				Magic:      [4]byte{'P', 'K', 'G', '1'},
-				FileSize:   500000,
-				DataOffset: 20,
+				BodySize:   500000,
+				BodyOffset: 20,
 				Copyright:  "test",
 			},
 			wantErr: false,
@@ -56,8 +57,8 @@ func TestWzReader_ReadHeader(t *testing.T) {
 			input: buildValidHeader(100000, ""),
 			want: &wz.Header{
 				Magic:      [4]byte{'P', 'K', 'G', '1'},
-				FileSize:   100000,
-				DataOffset: 16,
+				BodySize:   100000,
+				BodyOffset: 16,
 				Copyright:  "",
 			},
 			wantErr: false,
@@ -75,13 +76,13 @@ func TestWzReader_ReadHeader(t *testing.T) {
 			errMsg:  "failed to read magic",
 		},
 		{
-			name:    "EOF when reading file size",
+			name:    "EOF when reading body size",
 			input:   []byte{'P', 'K', 'G', '1', 0x00, 0x00},
 			wantErr: true,
-			errMsg:  "failed to read file size",
+			errMsg:  "failed to read body size",
 		},
 		{
-			name: "EOF when reading data offset",
+			name: "EOF when reading body offset",
 			input: func() []byte {
 				buf := new(bytes.Buffer)
 				buf.Write([]byte{'P', 'K', 'G', '1'})
@@ -90,10 +91,10 @@ func TestWzReader_ReadHeader(t *testing.T) {
 				return buf.Bytes()
 			}(),
 			wantErr: true,
-			errMsg:  "failed to read data start offset",
+			errMsg:  "failed to read body offset",
 		},
 		{
-			name: "invalid data offset (too small)",
+			name: "invalid body offset (too small)",
 			input: func() []byte {
 				buf := new(bytes.Buffer)
 				buf.Write([]byte{'P', 'K', 'G', '1'})
@@ -102,20 +103,20 @@ func TestWzReader_ReadHeader(t *testing.T) {
 				return buf.Bytes()
 			}(),
 			wantErr: true,
-			errMsg:  "invalid DataOffset value",
+			errMsg:  "invalid BodyOffset",
 		},
 		{
-			name: "EOF when reading copyright",
+			name: "EOF when reading header data",
 			input: func() []byte {
 				buf := new(bytes.Buffer)
 				buf.Write([]byte{'P', 'K', 'G', '1'})
 				binary.Write(buf, binary.LittleEndian, uint64(1000))
-				binary.Write(buf, binary.LittleEndian, uint32(50)) // expects 34 bytes of copyright
+				binary.Write(buf, binary.LittleEndian, uint32(50)) // expects 34 bytes of header data
 				buf.Write([]byte("short"))                         // only 5 bytes
 				return buf.Bytes()
 			}(),
 			wantErr: true,
-			errMsg:  "failed to read copyright",
+			errMsg:  "failed to read header data",
 		},
 		{
 			name:    "empty input",
@@ -124,12 +125,12 @@ func TestWzReader_ReadHeader(t *testing.T) {
 			errMsg:  "failed to read magic",
 		},
 		{
-			name:  "large file size",
+			name:  "large body size",
 			input: buildValidHeader(999999999999, "Large file test"),
 			want: &wz.Header{
 				Magic:      [4]byte{'P', 'K', 'G', '1'},
-				FileSize:   999999999999,
-				DataOffset: 31, // 16 + len("Large file test") = 16 + 15 = 31
+				BodySize:   999999999999,
+				BodyOffset: 31, // 16 + len("Large file test") = 16 + 15 = 31
 				Copyright:  "Large file test",
 			},
 			wantErr: false,
@@ -168,20 +169,28 @@ func TestWzReader_ReadHeader(t *testing.T) {
 	}
 }
 
-// setReaderFile uses reflection to set the unexported file field in WzReader
+// setReaderFile uses reflection to set the unexported fields in WzReader
 func setReaderFile(t *testing.T, r *parser.WzReader, reader io.ReadSeeker) {
 	t.Helper()
 
 	v := reflect.ValueOf(r).Elem()
-	fileField := v.FieldByName("file")
 
+	// Set file field
+	fileField := v.FieldByName("file")
 	if !fileField.IsValid() {
 		t.Fatal("field 'file' not found in WzReader")
 	}
-
-	// Use unsafe reflection to set unexported field
 	fileField = reflect.NewAt(fileField.Type(), fileField.Addr().UnsafePointer()).Elem()
 	fileField.Set(reflect.ValueOf(reader))
+
+	// Set logger field (required for Info/Debug logging in ReadHeader)
+	loggerField := v.FieldByName("logger")
+	if !loggerField.IsValid() {
+		t.Fatal("field 'logger' not found in WzReader")
+	}
+	loggerField = reflect.NewAt(loggerField.Type(), loggerField.Addr().UnsafePointer()).Elem()
+	// Use a no-op logger for tests (discards all output)
+	loggerField.Set(reflect.ValueOf(slog.New(slog.NewTextHandler(io.Discard, nil))))
 }
 
 // contains checks if a string contains a substring

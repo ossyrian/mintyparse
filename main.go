@@ -38,7 +38,7 @@ func init() {
 	rootCmd.MarkFlagRequired("input")
 	rootCmd.MarkFlagRequired("output")
 
-	// WZ settings
+	// game/format-specific settings
 	rootCmd.Flags().String("game-version", "gms", "MapleStory game version (gms, kms, sea, tms)")
 
 	// other opts
@@ -89,16 +89,17 @@ func parse(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("could not set up logging: %w", err)
 	}
 
-	slog.Info("parsing file", "input", cfg.InputFile)
-
 	file, err := os.Open(cfg.InputFile)
 	if err != nil {
 		return fmt.Errorf("failed to open WZ file: %w", err)
 	}
 	defer file.Close()
 
-	if err := parser.Parse(file); err != nil {
-		slog.Error(fmt.Sprintf("error parsing %s", cfg.InputFile), "error", err)
+	if err := parser.Parse(file, cfg); err != nil {
+		slog.Error("error parsing file",
+			"file", cfg.InputFile,
+			"error", err,
+		)
 
 		return nil
 	}
